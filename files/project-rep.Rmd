@@ -1,0 +1,1350 @@
+---
+title: "Project Report"
+author: "Group-9: Liva Dogan, Kadir Inip, Mehmet Yusuf Kaya"
+date: "13 02 2021"
+output: html_document
+---
+
+```{r libraries, include=FALSE}
+library(lubridate)
+library(zoo)
+library(forecast)
+library(data.table)
+library(urca)
+library(jsonlite)
+library(httr)
+library(ggplot2)
+
+
+get_token <- function(username, password, url_site){
+  
+  post_body = list(username=username,password=password)
+  post_url_string = paste0(url_site,'/token/')
+  result = POST(post_url_string, body = post_body)
+  
+  # error handling (wrong credentials)
+  if(result$status_code==400){
+    print('Check your credentials')
+    return(0)
+  }
+  else if (result$status_code==201){
+    output = content(result)
+    token = output$key
+  }
+  
+  return(token)
+}
+
+get_data <- function(start_date='2020-03-20', token, url_site){
+  
+  post_body = list(start_date=start_date,username=username,password=password)
+  post_url_string = paste0(url_site,'/dataset/')
+  
+  header = add_headers(c(Authorization=paste('Token',token,sep=' ')))
+  result = GET(post_url_string, header, body = post_body)
+  output = content(result)
+  data = data.table::rbindlist(output)
+  data[,event_date:=as.Date(event_date)]
+  data = data[order(event_date)]
+  return(data)
+}
+
+
+send_submission <- function(predictions, token, url_site, submit_now=F){
+  
+  format_check=check_format(predictions)
+  if(!format_check){
+    return(FALSE)
+  }
+  
+  post_string="list("
+  for(i in 1:nrow(predictions)){
+    if(i<nrow(predictions)){
+      post_string=sprintf("%s%s,",post_string,predictions$forecast[i])
+    } else {
+      post_string=sprintf("%s%s)",post_string,predictions$forecast[i])
+    }
+  }
+  
+  submission = eval(parse(text=post_string))
+  json_body = jsonlite::toJSON(submission, auto_unbox = TRUE)
+  submission=list(submission=json_body)
+  
+  print(submission)
+  # {"31515569":2.4,"32939029":2.4,"4066298":2.4,"6676673":2.4,"7061886":2.4,"85004":2.4} 
+  
+  if(!submit_now){
+    print("You did not submit.")
+    return(FALSE)      
+  }
+  
+  
+  header = add_headers(c(Authorization=paste('Token',token,sep=' ')))
+  post_url_string = paste0(url_site,'/submission/')
+  result = POST(post_url_string, header, body=submission)
+  
+  if (result$status_code==201){
+    print("Successfully submitted. Below you can see the details of your submission")
+  } else {
+    print("Could not submit. Please check the error message below, contact the assistant if needed.")
+  }
+  
+  print(content(result))
+  
+}
+
+check_format <- function(predictions){
+  
+  if(is.data.frame(predictions) | is.data.frame(predictions)){
+    if('forecast' %in% names(predictions)){
+      if(nrow(predictions)==24){
+        if(all(is.numeric(predictions$forecast))){
+          print("Format OK")
+          return(TRUE)
+        } else {
+          print("forecast information is not numeric")
+          return(FALSE)                
+        }
+      } else {
+        print("Forecasts for 24 hours should be provided, current number of rows:")
+        print(nrow(predictions))
+        return(FALSE)     
+      }
+    } 
+  } else {
+    print("Wrong format. Please provide data.frame or data.table object")
+    return(FALSE)
+  }
+  
+}
+
+```
+
+### 1. Introduction
+
+The goal of this project is to forecast the power demand of next day on hourly basis dates between 29 January 2021 to 12 February 2021. To do that a data set which contains past electricity consumptions and tempreratures for 7 different electricity grids were given on hourly basis dates between 1 January 2017 7 January 2021.
+
+Before deep diving to our forecast first I want to anaylze the parameters and data itself. At first sight it could be concluded that electricity demand is increasing by time, it means that it has trend component. This upward trend might be related to not only increasing electricity usage in our lives but also increasing GDP and population of Turkey with time. In addition to trend seasonality plays a key role to predict elektricity demand. Due to changing temperatute cooling and heating needs changing seasonally. In summers due to cooling demand we observe an increase in power demand. In winters because of heating demand in households we also see an increase in electricity consumption. In springs and autumns demand is relatively low. In our perspective air conditioners is the main reason for summer demand increase while increasing combi usage for winters.
+
+Beside trend and seasonality part, one can observe outliers at first glance. These outliers generally has very low demand compared to regular days. After analysis of these outliers we conclude that these days came across with National and Religious Holidays. We know that these days are national holidays and most of the stores and markets are closed all around the Turkey. Beside these outliers we observed that weekends have lower demand compared to weekdays due to holidays as expected.
+
+By using these market and data analyses, we will plot and observe the data and its parameters. Then we will manipulate the data corresponding to our purposes. After this we will build prediction models and predict the desired day's consumptions. In addition we will analyze models statistically and finalize our predictions then submit it.
+
+### 2. Data Importing and Manipulations
+
+In the first part of the project, we have hourly basis electricity consumption data between 01.01.2017 to 07.01.2021 fro EPIAS. The forecasted part of the electricity consumption will be 30.01.2021 to 13.01.2021 (2-week consumption) and the data of the dates between these two periods are imported with the help of API.
+The API codes and required manipulations is given in the RMD file, it can be reachable at the end of the report. In the profect report, it is hidden. 
+
+```{r data, include=FALSE}
+subm_url = 'http://46.101.124.77'
+u_name = "Group9"
+p_word = "EAo3p0rxc25PBMUf"
+submit_now = FALSE
+
+username = u_name
+password = p_word
+
+token = get_token(username=u_name, password=p_word, url=subm_url)
+data = get_data(token=token,url=subm_url)
+data <- data[order(event_date, event_hour)]
+
+consump <- as.data.table(read.table("projectdata.txt"))
+consump <- consump[-1,]
+colnames(consump) <- c("event_date" ,  "event_hour" ,"consumption", "t_1" , "t_2" ,
+                       "t_3" , "t_4" ,"t_5" , "t_6" , "t_7")
+consump$event_date <- as.Date(consump$event_date, "%Y-%m-%d")
+consump$event_hour <- as.integer(consump$event_hour)
+consump$consumption <- as.numeric(consump$consumption)
+consump$t_1 <- as.numeric(consump$t_1)
+consump$t_2 <- as.numeric(consump$t_2)
+consump$t_3 <- as.numeric(consump$t_3)
+consump$t_4 <- as.numeric(consump$t_4)
+consump$t_5 <- as.numeric(consump$t_5)
+consump$t_6 <- as.numeric(consump$t_6)
+consump$t_7 <- as.numeric(consump$t_7)
+```
+
+```{r, include = TRUE,echo=FALSE}
+ggplot(consump, aes(x= event_date, y= consumption)) + geom_line()  + labs(x = "Date", y = "Consumption", caption = "datasource = EPIAS") 
+```
+
+As we observe the general electricity consumption line graph, there are some sharp decreases occuring seasonally. The reason behind the picture is the national and religious days. As the governmental organizations and private companies are closed in that special dates, the electricity consumption decreases significantly for those dates. To be able to use this effect on the model, we should add these dates as columns. However, since the dates of the religious days change year to year, we should add this data manually to the dataset.
+
+
+```{r manipuls , include=FALSE}
+consump[, RelDayMond:=0]
+consump[, RelDayTues:=0]
+consump[, RelDayWedn:=0]
+consump[, RelDayThur:=0]
+consump[, RelDayFrid:=0]
+consump[, RelDaySatu:=0]
+consump[, RelDaySund:=0]
+consump[, SpeDayMond:=0]
+consump[, SpeDayTues:=0]
+consump[, SpeDayWedn:=0]
+consump[, SpeDayThur:=0]
+consump[, SpeDayFrid:=0]
+consump[, SpeDaySatu:=0]
+consump[, SpeDaySund:=0]
+
+consump[ which(consump$event_date == "2017-01-01") ,SpeDaySund := 1]
+consump[ which(consump$event_date == "2017-04-23") ,SpeDaySund := 1]
+consump[ which(consump$event_date == "2017-05-01") ,SpeDayMond := 1]
+consump[ which(consump$event_date == "2017-05-19") ,SpeDayFrid := 1]
+consump[ which(consump$event_date == "2017-06-24") ,RelDaySatu := 1]
+consump[ which(consump$event_date == "2017-06-25") ,RelDaySund := 1]
+consump[ which(consump$event_date == "2017-06-26") ,RelDayMond := 1]
+consump[ which(consump$event_date == "2017-06-27") ,RelDayTues := 1]
+consump[ which(consump$event_date == "2017-07-15") ,SpeDaySatu := 1]
+consump[ which(consump$event_date == "2017-08-30") ,SpeDayWedn := 1]
+consump[ which(consump$event_date == "2017-08-31") ,RelDayThur := 1]
+consump[ which(consump$event_date == "2017-09-01") ,RelDayFrid := 1]
+consump[ which(consump$event_date == "2017-09-02") ,RelDaySatu := 1]
+consump[ which(consump$event_date == "2017-09-03") ,RelDaySund := 1]
+consump[ which(consump$event_date == "2017-09-04") ,RelDayMond := 1]
+consump[ which(consump$event_date == "2017-10-29") ,RelDaySund := 1]
+consump[ which(consump$event_date == "2017-12-31") ,SpeDaySund := 1]
+
+consump[ which(consump$event_date == "2018-01-01") ,SpeDayMond := 1]
+consump[ which(consump$event_date == "2018-04-23") ,SpeDayMond := 1]
+consump[ which(consump$event_date == "2018-05-01") ,SpeDayTues := 1]
+consump[ which(consump$event_date == "2018-05-19") ,SpeDayMond := 1]
+consump[ which(consump$event_date == "2018-06-14") ,RelDayThur := 1]
+consump[ which(consump$event_date == "2018-06-15") ,RelDayFrid := 1]
+consump[ which(consump$event_date == "2018-06-16") ,RelDaySatu := 1]
+consump[ which(consump$event_date == "2018-06-17") ,RelDaySund := 1]
+consump[ which(consump$event_date == "2018-07-15") ,SpeDaySund := 1]
+consump[ which(consump$event_date == "2018-08-20") ,RelDayMond := 1]
+consump[ which(consump$event_date == "2018-08-21") ,RelDayTues := 1]
+consump[ which(consump$event_date == "2018-08-22") ,RelDayWedn := 1]
+consump[ which(consump$event_date == "2018-08-23") ,RelDayThur := 1]
+consump[ which(consump$event_date == "2018-08-24") ,RelDayFrid := 1]
+consump[ which(consump$event_date == "2018-08-30") ,SpeDayThur := 1]
+consump[ which(consump$event_date == "2018-10-29") ,SpeDayMond := 1]
+consump[ which(consump$event_date == "2018-12-31") ,SpeDayMond := 1]
+
+consump[ which(consump$event_date == "2019-01-01") ,SpeDayTues := 1]
+consump[ which(consump$event_date == "2019-04-23") ,SpeDayTues := 1]
+consump[ which(consump$event_date == "2019-05-01") ,SpeDayWedn := 1]
+consump[ which(consump$event_date == "2019-05-19") ,SpeDaySund := 1]
+consump[ which(consump$event_date == "2019-06-04") ,RelDayTues := 1]
+consump[ which(consump$event_date == "2019-06-05") ,RelDayWedn := 1]
+consump[ which(consump$event_date == "2019-06-06") ,RelDayThur := 1]
+consump[ which(consump$event_date == "2019-06-07") ,RelDayFrid := 1]
+consump[ which(consump$event_date == "2019-07-15") ,SpeDayMond := 1]
+consump[ which(consump$event_date == "2019-08-10") ,RelDaySatu := 1]
+consump[ which(consump$event_date == "2019-08-11") ,RelDaySund := 1]
+consump[ which(consump$event_date == "2019-08-12") ,RelDayMond := 1]
+consump[ which(consump$event_date == "2019-08-13") ,RelDayTues := 1]
+consump[ which(consump$event_date == "2019-08-14") ,RelDayWedn := 1]
+consump[ which(consump$event_date == "2019-08-30") ,SpeDayFrid := 1]
+consump[ which(consump$event_date == "2019-10-29") ,SpeDayTues := 1]
+consump[ which(consump$event_date == "2019-12-31") ,SpeDayTues := 1]
+
+consump[ which(consump$event_date == "2020-01-01") ,SpeDayWedn := 1]
+consump[ which(consump$event_date == "2020-04-23") ,SpeDayThur := 1]
+consump[ which(consump$event_date == "2020-05-01") ,SpeDayFrid := 1]
+consump[ which(consump$event_date == "2020-05-19") ,SpeDayTues := 1]
+consump[ which(consump$event_date == "2020-05-23") ,RelDaySatu := 1]
+consump[ which(consump$event_date == "2020-05-24") ,RelDaySund := 1]
+consump[ which(consump$event_date == "2020-05-25") ,RelDayMond := 1]
+consump[ which(consump$event_date == "2020-05-26") ,RelDayTues := 1]
+consump[ which(consump$event_date == "2020-07-15") ,SpeDayWedn := 1]
+consump[ which(consump$event_date == "2020-07-30") ,RelDayThur := 1]
+consump[ which(consump$event_date == "2020-07-31") ,RelDayFrid := 1]
+consump[ which(consump$event_date == "2020-08-01") ,RelDaySatu := 1]
+consump[ which(consump$event_date == "2020-08-02") ,RelDaySund := 1]
+consump[ which(consump$event_date == "2020-08-03") ,RelDayMond := 1]
+consump[ which(consump$event_date == "2020-08-30") ,SpeDaySund := 1]
+consump[ which(consump$event_date == "2020-10-29") ,SpeDayThur := 1]
+consump[ which(consump$event_date == "2020-12-31") ,SpeDayThur := 1]
+
+consump[ which(consump$event_date == "2021-01-01") ,SpeDayFrid := 1]
+
+total_consumption <- rbind(consump, data, fill = T)
+total_consumption[is.na(total_consumption)] = 0       #because all special day variables are 0 for these dates
+```
+
+It can be observed that the total data has 2 types of seasonality, one of the two is daily seasonality and the other is weekly seasonality. The aim of our model is using both seasonal parts of the data. These can be understood as the hour-of-day effect and day-of-week effect. In order to use the hour-of-day effect, we may group our data by its hour. As an example: 
+
+```{r, include=TRUE, results='hide', warning=FALSE, message=FALSE}
+total_consumption0 <- total_consumption[which(event_hour == 0)]
+```
+
+```{r,include = TRUE , echo = FALSE}
+total_consumption1 <- total_consumption[which(event_hour == 1)]
+total_consumption2 <- total_consumption[which(event_hour == 2)]
+total_consumption3 <- total_consumption[which(event_hour == 3)]
+total_consumption4 <- total_consumption[which(event_hour == 4)]
+total_consumption5 <- total_consumption[which(event_hour == 5)]
+total_consumption6 <- total_consumption[which(event_hour == 6)]
+total_consumption7 <- total_consumption[which(event_hour == 7)]
+total_consumption8 <- total_consumption[which(event_hour == 8)]
+total_consumption9 <- total_consumption[which(event_hour == 9)]
+total_consumption10 <- total_consumption[which(event_hour == 10)]
+total_consumption11 <- total_consumption[which(event_hour == 11)]
+total_consumption12 <- total_consumption[which(event_hour == 12)]
+total_consumption13 <- total_consumption[which(event_hour == 13)]
+total_consumption14 <- total_consumption[which(event_hour == 14)]
+total_consumption15 <- total_consumption[which(event_hour == 15)]
+total_consumption16 <- total_consumption[which(event_hour == 16)]
+total_consumption17 <- total_consumption[which(event_hour == 17)]
+total_consumption18 <- total_consumption[which(event_hour == 18)]
+total_consumption19 <- total_consumption[which(event_hour == 19)]
+total_consumption20 <- total_consumption[which(event_hour == 20)]
+total_consumption21 <- total_consumption[which(event_hour == 21)]
+total_consumption22 <- total_consumption[which(event_hour == 22)]
+total_consumption23 <- total_consumption[which(event_hour == 23)]
+```
+
+After we eliminate the daily seasonality, we achieved more stationary data. However, it is inadequate. To reach more stationary data to build an appropriate arima model, we should take the weekly difference from total consumption data. Let's proceed total_consumption0 example:
+
+```{r, include=TRUE, results='hide', warning=FALSE, message=FALSE}
+total_consumption0[, WeeklyDiff := consumption - shift(consumption, 7)]
+```
+
+```{r,include = TRUE , echo = FALSE}
+total_consumption1[, WeeklyDiff := consumption - shift(consumption, 7)]
+total_consumption2[, WeeklyDiff := consumption - shift(consumption, 7)]
+total_consumption3[, WeeklyDiff := consumption - shift(consumption, 7)]
+total_consumption4[, WeeklyDiff := consumption - shift(consumption, 7)]
+total_consumption5[, WeeklyDiff := consumption - shift(consumption, 7)]
+total_consumption6[, WeeklyDiff := consumption - shift(consumption, 7)]
+total_consumption7[, WeeklyDiff := consumption - shift(consumption, 7)]
+total_consumption8[, WeeklyDiff := consumption - shift(consumption, 7)]
+total_consumption9[, WeeklyDiff := consumption - shift(consumption, 7)]
+total_consumption10[, WeeklyDiff := consumption - shift(consumption, 7)]
+total_consumption11[, WeeklyDiff := consumption - shift(consumption, 7)]
+total_consumption12[, WeeklyDiff := consumption - shift(consumption, 7)]
+total_consumption13[, WeeklyDiff := consumption - shift(consumption, 7)]
+total_consumption14[, WeeklyDiff := consumption - shift(consumption, 7)]
+total_consumption15[, WeeklyDiff := consumption - shift(consumption, 7)]
+total_consumption16[, WeeklyDiff := consumption - shift(consumption, 7)]
+total_consumption17[, WeeklyDiff := consumption - shift(consumption, 7)]
+total_consumption18[, WeeklyDiff := consumption - shift(consumption, 7)]
+total_consumption19[, WeeklyDiff := consumption - shift(consumption, 7)]
+total_consumption20[, WeeklyDiff := consumption - shift(consumption, 7)]
+total_consumption21[, WeeklyDiff := consumption - shift(consumption, 7)]
+total_consumption22[, WeeklyDiff := consumption - shift(consumption, 7)]
+total_consumption23[, WeeklyDiff := consumption - shift(consumption, 7)]
+```
+
+### 3. Forecasting with ARIMA Model
+
+Now, our data is stationary enough to build an arima model to forecast future consumption. Instead of using pure arima model, we preffered to use some regressors to develop accuracy of the predictions. As we defined above, we can use the dates of the religious and special days as model regressors. For example model for hour0 is defined as below:   
+
+```{r, include=TRUE, results='hide', warning=FALSE, message=FALSE}
+regressor0 <- cbind(total_consumption0$RelDayMond[which(total_consumption0$event_date < 
+                                                          (max(total_consumption$event_date) - 2))], 
+                    total_consumption0$RelDayTues[which(total_consumption0$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption0$RelDayWedn[which(total_consumption0$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption0$RelDayThur[which(total_consumption0$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption0$RelDayFrid[which(total_consumption0$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption0$RelDaySatu[which(total_consumption0$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption0$RelDaySund[which(total_consumption0$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption0$SpeDayMond[which(total_consumption0$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption0$SpeDayTues[which(total_consumption0$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption0$SpeDayWedn[which(total_consumption0$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption0$SpeDayThur[which(total_consumption0$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption0$SpeDayFrid[which(total_consumption0$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption0$SpeDaySatu[which(total_consumption0$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption0$SpeDaySund[which(total_consumption0$event_date < 
+                                                          (max(total_consumption$event_date) - 2))])
+arima_model0 = auto.arima(total_consumption0$WeeklyDiff[which(total_consumption0$event_date < 
+                                                                (max(total_consumption$event_date) - 2))],
+                          xreg = regressor0)
+```
+
+
+```{r,include = TRUE , echo = FALSE}
+regressor1 <- cbind(total_consumption1$RelDayMond[which(total_consumption1$event_date < 
+                                                          (max(total_consumption$event_date) - 2))], 
+                    total_consumption1$RelDayTues[which(total_consumption1$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption1$RelDayWedn[which(total_consumption1$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption1$RelDayThur[which(total_consumption1$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption1$RelDayFrid[which(total_consumption1$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption1$RelDaySatu[which(total_consumption1$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption1$RelDaySund[which(total_consumption1$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption1$SpeDayMond[which(total_consumption1$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption1$SpeDayTues[which(total_consumption1$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption1$SpeDayWedn[which(total_consumption1$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption1$SpeDayThur[which(total_consumption1$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption1$SpeDayFrid[which(total_consumption1$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption1$SpeDaySatu[which(total_consumption1$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption1$SpeDaySund[which(total_consumption1$event_date < 
+                                                          (max(total_consumption$event_date) - 2))])
+arima_model1 = auto.arima(total_consumption1$WeeklyDiff[which(total_consumption1$event_date < 
+                                                                (max(total_consumption$event_date) - 2))],
+                          xreg = regressor1)
+
+regressor2 <- cbind(total_consumption2$RelDayMond[which(total_consumption2$event_date < 
+                                                          (max(total_consumption$event_date) - 2))], 
+                    total_consumption2$RelDayTues[which(total_consumption2$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption2$RelDayWedn[which(total_consumption2$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption2$RelDayThur[which(total_consumption2$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption2$RelDayFrid[which(total_consumption2$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption2$RelDaySatu[which(total_consumption2$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption2$RelDaySund[which(total_consumption2$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption2$SpeDayMond[which(total_consumption2$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption2$SpeDayTues[which(total_consumption2$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption2$SpeDayWedn[which(total_consumption2$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption2$SpeDayThur[which(total_consumption2$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption2$SpeDayFrid[which(total_consumption2$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption2$SpeDaySatu[which(total_consumption2$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption2$SpeDaySund[which(total_consumption2$event_date < 
+                                                          (max(total_consumption$event_date) - 2))])
+arima_model2 = auto.arima(total_consumption2$WeeklyDiff[which(total_consumption2$event_date < 
+                                                                (max(total_consumption$event_date) - 2))],
+                          xreg = regressor2)
+
+regressor3 <- cbind(total_consumption3$RelDayMond[which(total_consumption3$event_date < 
+                                                          (max(total_consumption$event_date) - 2))], 
+                    total_consumption3$RelDayTues[which(total_consumption3$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption3$RelDayWedn[which(total_consumption3$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption3$RelDayThur[which(total_consumption3$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption3$RelDayFrid[which(total_consumption3$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption3$RelDaySatu[which(total_consumption3$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption3$RelDaySund[which(total_consumption3$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption3$SpeDayMond[which(total_consumption3$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption3$SpeDayTues[which(total_consumption3$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption3$SpeDayWedn[which(total_consumption3$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption3$SpeDayThur[which(total_consumption3$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption3$SpeDayFrid[which(total_consumption3$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption3$SpeDaySatu[which(total_consumption3$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption3$SpeDaySund[which(total_consumption3$event_date < 
+                                                          (max(total_consumption$event_date) - 2))])
+arima_model3 = auto.arima(total_consumption3$WeeklyDiff[which(total_consumption3$event_date < 
+                                                                (max(total_consumption$event_date) - 2))],
+                          xreg = regressor3)
+
+regressor4 <- cbind(total_consumption4$RelDayMond[which(total_consumption4$event_date < 
+                                                          (max(total_consumption$event_date) - 2))], 
+                    total_consumption4$RelDayTues[which(total_consumption4$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption4$RelDayWedn[which(total_consumption4$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption4$RelDayThur[which(total_consumption4$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption4$RelDayFrid[which(total_consumption4$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption4$RelDaySatu[which(total_consumption4$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption4$RelDaySund[which(total_consumption4$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption4$SpeDayMond[which(total_consumption4$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption4$SpeDayTues[which(total_consumption4$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption4$SpeDayWedn[which(total_consumption4$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption4$SpeDayThur[which(total_consumption4$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption4$SpeDayFrid[which(total_consumption4$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption4$SpeDaySatu[which(total_consumption4$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption4$SpeDaySund[which(total_consumption4$event_date < 
+                                                          (max(total_consumption$event_date) - 2))])
+arima_model4 = auto.arima(total_consumption4$WeeklyDiff[which(total_consumption4$event_date < 
+                                                                (max(total_consumption$event_date) - 2))],
+                          xreg = regressor4)
+
+regressor5 <- cbind(total_consumption5$RelDayMond[which(total_consumption5$event_date < 
+                                                          (max(total_consumption$event_date) - 2))], 
+                    total_consumption5$RelDayTues[which(total_consumption5$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption5$RelDayWedn[which(total_consumption5$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption5$RelDayThur[which(total_consumption5$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption5$RelDayFrid[which(total_consumption5$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption5$RelDaySatu[which(total_consumption5$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption5$RelDaySund[which(total_consumption5$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption5$SpeDayMond[which(total_consumption5$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption5$SpeDayTues[which(total_consumption5$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption5$SpeDayWedn[which(total_consumption5$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption5$SpeDayThur[which(total_consumption5$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption5$SpeDayFrid[which(total_consumption5$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption5$SpeDaySatu[which(total_consumption5$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption5$SpeDaySund[which(total_consumption5$event_date < 
+                                                          (max(total_consumption$event_date) - 2))])
+arima_model5 = auto.arima(total_consumption5$WeeklyDiff[which(total_consumption5$event_date < 
+                                                                (max(total_consumption$event_date) - 2))],
+                          xreg = regressor5)
+
+regressor6 <- cbind(total_consumption6$RelDayMond[which(total_consumption6$event_date < 
+                                                          (max(total_consumption$event_date) - 2))], 
+                    total_consumption6$RelDayTues[which(total_consumption6$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption6$RelDayWedn[which(total_consumption6$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption6$RelDayThur[which(total_consumption6$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption6$RelDayFrid[which(total_consumption6$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption6$RelDaySatu[which(total_consumption6$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption6$RelDaySund[which(total_consumption6$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption6$SpeDayMond[which(total_consumption6$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption6$SpeDayTues[which(total_consumption6$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption6$SpeDayWedn[which(total_consumption6$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption6$SpeDayThur[which(total_consumption6$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption6$SpeDayFrid[which(total_consumption6$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption6$SpeDaySatu[which(total_consumption6$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption6$SpeDaySund[which(total_consumption6$event_date < 
+                                                          (max(total_consumption$event_date) - 2))])
+arima_model6 = auto.arima(total_consumption6$WeeklyDiff[which(total_consumption6$event_date < 
+                                                                (max(total_consumption$event_date) - 2))],
+                          xreg = regressor6)
+
+regressor7 <- cbind(total_consumption7$RelDayMond[which(total_consumption7$event_date < 
+                                                          (max(total_consumption$event_date) - 2))], 
+                    total_consumption7$RelDayTues[which(total_consumption7$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption7$RelDayWedn[which(total_consumption7$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption7$RelDayThur[which(total_consumption7$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption7$RelDayFrid[which(total_consumption7$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption7$RelDaySatu[which(total_consumption7$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption7$RelDaySund[which(total_consumption7$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption7$SpeDayMond[which(total_consumption7$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption7$SpeDayTues[which(total_consumption7$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption7$SpeDayWedn[which(total_consumption7$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption7$SpeDayThur[which(total_consumption7$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption7$SpeDayFrid[which(total_consumption7$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption7$SpeDaySatu[which(total_consumption7$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption7$SpeDaySund[which(total_consumption7$event_date < 
+                                                          (max(total_consumption$event_date) - 2))])
+arima_model7 = auto.arima(total_consumption7$WeeklyDiff[which(total_consumption7$event_date < 
+                                                                (max(total_consumption$event_date) - 2))],
+                          xreg = regressor7)
+
+regressor8 <- cbind(total_consumption8$RelDayMond[which(total_consumption8$event_date < 
+                                                          (max(total_consumption$event_date) - 2))], 
+                    total_consumption8$RelDayTues[which(total_consumption8$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption8$RelDayWedn[which(total_consumption8$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption8$RelDayThur[which(total_consumption8$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption8$RelDayFrid[which(total_consumption8$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption8$RelDaySatu[which(total_consumption8$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption8$RelDaySund[which(total_consumption8$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption8$SpeDayMond[which(total_consumption8$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption8$SpeDayTues[which(total_consumption8$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption8$SpeDayWedn[which(total_consumption8$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption8$SpeDayThur[which(total_consumption8$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption8$SpeDayFrid[which(total_consumption8$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption8$SpeDaySatu[which(total_consumption8$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption8$SpeDaySund[which(total_consumption8$event_date < 
+                                                          (max(total_consumption$event_date) - 2))])
+arima_model8 = auto.arima(total_consumption8$WeeklyDiff[which(total_consumption8$event_date < 
+                                                                (max(total_consumption$event_date) - 2))],
+                          xreg = regressor8)
+
+regressor9 <- cbind(total_consumption9$RelDayMond[which(total_consumption9$event_date < 
+                                                          (max(total_consumption$event_date) - 2))], 
+                    total_consumption9$RelDayTues[which(total_consumption9$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption9$RelDayWedn[which(total_consumption9$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption9$RelDayThur[which(total_consumption9$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption9$RelDayFrid[which(total_consumption9$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption9$RelDaySatu[which(total_consumption9$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption9$RelDaySund[which(total_consumption9$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption9$SpeDayMond[which(total_consumption9$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption9$SpeDayTues[which(total_consumption9$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption9$SpeDayWedn[which(total_consumption9$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption9$SpeDayThur[which(total_consumption9$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption9$SpeDayFrid[which(total_consumption9$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption9$SpeDaySatu[which(total_consumption9$event_date < 
+                                                          (max(total_consumption$event_date) - 2))],
+                    total_consumption9$SpeDaySund[which(total_consumption9$event_date < 
+                                                          (max(total_consumption$event_date) - 2))])
+arima_model9 = auto.arima(total_consumption9$WeeklyDiff[which(total_consumption9$event_date < 
+                                                                (max(total_consumption$event_date) - 2))],
+                          xreg = regressor9)
+
+regressor10 <- cbind(total_consumption10$RelDayMond[which(total_consumption10$event_date < 
+                                                            (max(total_consumption$event_date) - 2))], 
+                    total_consumption10$RelDayTues[which(total_consumption10$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption10$RelDayWedn[which(total_consumption10$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption10$RelDayThur[which(total_consumption10$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption10$RelDayFrid[which(total_consumption10$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption10$RelDaySatu[which(total_consumption10$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption10$RelDaySund[which(total_consumption10$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption10$SpeDayMond[which(total_consumption10$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption10$SpeDayTues[which(total_consumption10$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption10$SpeDayWedn[which(total_consumption10$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption10$SpeDayThur[which(total_consumption10$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption10$SpeDayFrid[which(total_consumption10$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption10$SpeDaySatu[which(total_consumption10$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption10$SpeDaySund[which(total_consumption10$event_date < 
+                                                           (max(total_consumption$event_date) - 2))])
+arima_model10 = auto.arima(total_consumption10$WeeklyDiff[which(total_consumption10$event_date < 
+                                                                  (max(total_consumption$event_date) - 2))],
+                           xreg = regressor10)
+
+regressor11 <- cbind(total_consumption11$RelDayMond[which(total_consumption11$event_date < 
+                                                            (max(total_consumption$event_date) - 2))], 
+                    total_consumption11$RelDayTues[which(total_consumption11$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption11$RelDayWedn[which(total_consumption11$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption11$RelDayThur[which(total_consumption11$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption11$RelDayFrid[which(total_consumption11$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption11$RelDaySatu[which(total_consumption11$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption11$RelDaySund[which(total_consumption11$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption11$SpeDayMond[which(total_consumption11$event_date <
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption11$SpeDayTues[which(total_consumption11$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption11$SpeDayWedn[which(total_consumption11$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption11$SpeDayThur[which(total_consumption11$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption11$SpeDayFrid[which(total_consumption11$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption11$SpeDaySatu[which(total_consumption11$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption11$SpeDaySund[which(total_consumption11$event_date < 
+                                                           (max(total_consumption$event_date) - 2))])
+arima_model11 = auto.arima(total_consumption11$WeeklyDiff[which(total_consumption11$event_date < 
+                                                                  (max(total_consumption$event_date) - 2))],
+                           xreg = regressor11)
+
+regressor12 <- cbind(total_consumption12$RelDayMond[which(total_consumption12$event_date < 
+                                                            (max(total_consumption$event_date) - 2))], 
+                    total_consumption12$RelDayTues[which(total_consumption12$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption12$RelDayWedn[which(total_consumption12$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption12$RelDayThur[which(total_consumption12$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption12$RelDayFrid[which(total_consumption12$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption12$RelDaySatu[which(total_consumption12$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption12$RelDaySund[which(total_consumption12$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption12$SpeDayMond[which(total_consumption12$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption12$SpeDayTues[which(total_consumption12$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption12$SpeDayWedn[which(total_consumption12$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption12$SpeDayThur[which(total_consumption12$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption12$SpeDayFrid[which(total_consumption12$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption12$SpeDaySatu[which(total_consumption12$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption12$SpeDaySund[which(total_consumption12$event_date < 
+                                                           (max(total_consumption$event_date) - 2))])
+arima_model12 = auto.arima(total_consumption12$WeeklyDiff[which(total_consumption12$event_date < 
+                                                                  (max(total_consumption$event_date) - 2))],
+                           xreg = regressor12)
+
+regressor13 <- cbind(total_consumption13$RelDayMond[which(total_consumption13$event_date < 
+                                                            (max(total_consumption$event_date) - 2))], 
+                    total_consumption13$RelDayTues[which(total_consumption13$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption13$RelDayWedn[which(total_consumption13$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption13$RelDayThur[which(total_consumption13$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption13$RelDayFrid[which(total_consumption13$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption13$RelDaySatu[which(total_consumption13$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption13$RelDaySund[which(total_consumption13$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption13$SpeDayMond[which(total_consumption13$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption13$SpeDayTues[which(total_consumption13$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption13$SpeDayWedn[which(total_consumption13$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption13$SpeDayThur[which(total_consumption13$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption13$SpeDayFrid[which(total_consumption13$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption13$SpeDaySatu[which(total_consumption13$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption13$SpeDaySund[which(total_consumption13$event_date < 
+                                                           (max(total_consumption$event_date) - 2))])
+arima_model13 = auto.arima(total_consumption13$WeeklyDiff[which(total_consumption13$event_date < 
+                                                                  (max(total_consumption$event_date) - 2))],
+                           xreg = regressor13)
+
+regressor14 <- cbind(total_consumption14$RelDayMond[which(total_consumption14$event_date < 
+                                                            (max(total_consumption$event_date) - 2))], 
+                    total_consumption14$RelDayTues[which(total_consumption14$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption14$RelDayWedn[which(total_consumption14$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption14$RelDayThur[which(total_consumption14$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption14$RelDayFrid[which(total_consumption14$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption14$RelDaySatu[which(total_consumption14$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption14$RelDaySund[which(total_consumption14$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption14$SpeDayMond[which(total_consumption14$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption14$SpeDayTues[which(total_consumption14$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption14$SpeDayWedn[which(total_consumption14$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption14$SpeDayThur[which(total_consumption14$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption14$SpeDayFrid[which(total_consumption14$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption14$SpeDaySatu[which(total_consumption14$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption14$SpeDaySund[which(total_consumption14$event_date < 
+                                                           (max(total_consumption$event_date) - 2))])
+arima_model14 = auto.arima(total_consumption14$WeeklyDiff[which(total_consumption14$event_date < 
+                                                                  (max(total_consumption$event_date) - 2))],
+                           xreg = regressor14)
+
+regressor15 <- cbind(total_consumption15$RelDayMond[which(total_consumption15$event_date < 
+                                                            (max(total_consumption$event_date) - 2))], 
+                    total_consumption15$RelDayTues[which(total_consumption15$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption15$RelDayWedn[which(total_consumption15$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption15$RelDayThur[which(total_consumption15$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption15$RelDayFrid[which(total_consumption15$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption15$RelDaySatu[which(total_consumption15$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption15$RelDaySund[which(total_consumption15$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption15$SpeDayMond[which(total_consumption15$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption15$SpeDayTues[which(total_consumption15$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption15$SpeDayWedn[which(total_consumption15$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption15$SpeDayThur[which(total_consumption15$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption15$SpeDayFrid[which(total_consumption15$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption15$SpeDaySatu[which(total_consumption15$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption15$SpeDaySund[which(total_consumption15$event_date < 
+                                                           (max(total_consumption$event_date) - 2))])
+arima_model15 = auto.arima(total_consumption15$WeeklyDiff[which(total_consumption15$event_date < 
+                                                                  (max(total_consumption$event_date) - 2))],
+                           xreg = regressor15)
+
+regressor16 <- cbind(total_consumption16$RelDayMond[which(total_consumption16$event_date < 
+                                                            (max(total_consumption$event_date) - 2))], 
+                    total_consumption16$RelDayTues[which(total_consumption16$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption16$RelDayWedn[which(total_consumption16$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption16$RelDayThur[which(total_consumption16$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption16$RelDayFrid[which(total_consumption16$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption16$RelDaySatu[which(total_consumption16$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption16$RelDaySund[which(total_consumption16$event_date <
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption16$SpeDayMond[which(total_consumption16$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption16$SpeDayTues[which(total_consumption16$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption16$SpeDayWedn[which(total_consumption16$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption16$SpeDayThur[which(total_consumption16$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption16$SpeDayFrid[which(total_consumption16$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption16$SpeDaySatu[which(total_consumption16$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption16$SpeDaySund[which(total_consumption16$event_date < 
+                                                           (max(total_consumption$event_date) - 2))])
+arima_model16 = auto.arima(total_consumption16$WeeklyDiff[which(total_consumption16$event_date < 
+                                                                  (max(total_consumption$event_date) - 2))],
+                           xreg = regressor16)
+
+regressor17 <- cbind(total_consumption17$RelDayMond[which(total_consumption17$event_date < 
+                                                            (max(total_consumption$event_date) - 2))], 
+                    total_consumption17$RelDayTues[which(total_consumption17$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption17$RelDayWedn[which(total_consumption17$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption17$RelDayThur[which(total_consumption17$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption17$RelDayFrid[which(total_consumption17$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption17$RelDaySatu[which(total_consumption17$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption17$RelDaySund[which(total_consumption17$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption17$SpeDayMond[which(total_consumption17$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption17$SpeDayTues[which(total_consumption17$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption17$SpeDayWedn[which(total_consumption17$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption17$SpeDayThur[which(total_consumption17$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption17$SpeDayFrid[which(total_consumption17$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption17$SpeDaySatu[which(total_consumption17$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption17$SpeDaySund[which(total_consumption17$event_date < 
+                                                           (max(total_consumption$event_date) - 2))])
+arima_model17 = auto.arima(total_consumption17$WeeklyDiff[which(total_consumption17$event_date < 
+                                                                  (max(total_consumption$event_date) - 2))],
+                           xreg = regressor17)
+
+regressor18 <- cbind(total_consumption18$RelDayMond[which(total_consumption18$event_date < 
+                                                            (max(total_consumption$event_date) - 2))], 
+                    total_consumption18$RelDayTues[which(total_consumption18$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption18$RelDayWedn[which(total_consumption18$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption18$RelDayThur[which(total_consumption18$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption18$RelDayFrid[which(total_consumption18$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption18$RelDaySatu[which(total_consumption18$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption18$RelDaySund[which(total_consumption18$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption18$SpeDayMond[which(total_consumption18$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption18$SpeDayTues[which(total_consumption18$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption18$SpeDayWedn[which(total_consumption18$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption18$SpeDayThur[which(total_consumption18$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption18$SpeDayFrid[which(total_consumption18$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption18$SpeDaySatu[which(total_consumption18$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption18$SpeDaySund[which(total_consumption18$event_date < 
+                                                           (max(total_consumption$event_date) - 2))])
+arima_model18 = auto.arima(total_consumption18$WeeklyDiff[which(total_consumption18$event_date < 
+                                                                  (max(total_consumption$event_date) - 2))],
+                           xreg = regressor18)
+
+regressor19 <- cbind(total_consumption19$RelDayMond[which(total_consumption19$event_date < 
+                                                            (max(total_consumption$event_date) - 2))], 
+                    total_consumption19$RelDayTues[which(total_consumption19$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption19$RelDayWedn[which(total_consumption19$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption19$RelDayThur[which(total_consumption19$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption19$RelDayFrid[which(total_consumption19$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption19$RelDaySatu[which(total_consumption19$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption19$RelDaySund[which(total_consumption19$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption19$SpeDayMond[which(total_consumption19$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption19$SpeDayTues[which(total_consumption19$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption19$SpeDayWedn[which(total_consumption19$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption19$SpeDayThur[which(total_consumption19$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption19$SpeDayFrid[which(total_consumption19$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption19$SpeDaySatu[which(total_consumption19$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption19$SpeDaySund[which(total_consumption19$event_date < 
+                                                           (max(total_consumption$event_date) - 2))])
+arima_model19 = auto.arima(total_consumption19$WeeklyDiff[which(total_consumption19$event_date < 
+                                                                  (max(total_consumption$event_date) - 2))],
+                           xreg = regressor19)
+
+regressor20 <- cbind(total_consumption20$RelDayMond[which(total_consumption20$event_date < 
+                                                            (max(total_consumption$event_date) - 2))], 
+                    total_consumption20$RelDayTues[which(total_consumption20$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption20$RelDayWedn[which(total_consumption20$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption20$RelDayThur[which(total_consumption20$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption20$RelDayFrid[which(total_consumption20$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption20$RelDaySatu[which(total_consumption20$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption20$RelDaySund[which(total_consumption20$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption20$SpeDayMond[which(total_consumption20$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption20$SpeDayTues[which(total_consumption20$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption20$SpeDayWedn[which(total_consumption20$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption20$SpeDayThur[which(total_consumption20$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption20$SpeDayFrid[which(total_consumption20$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption20$SpeDaySatu[which(total_consumption20$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption20$SpeDaySund[which(total_consumption20$event_date < 
+                                                           (max(total_consumption$event_date) - 2))])
+arima_model20 = auto.arima(total_consumption20$WeeklyDiff[which(total_consumption20$event_date < 
+                                                                  (max(total_consumption$event_date) - 2))],
+                           xreg = regressor20)
+
+regressor21 <- cbind(total_consumption21$RelDayMond[which(total_consumption21$event_date < 
+                                                            (max(total_consumption$event_date) - 2))], 
+                    total_consumption21$RelDayTues[which(total_consumption21$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption21$RelDayWedn[which(total_consumption21$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption21$RelDayThur[which(total_consumption21$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption21$RelDayFrid[which(total_consumption21$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption21$RelDaySatu[which(total_consumption21$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption21$RelDaySund[which(total_consumption21$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption21$SpeDayMond[which(total_consumption21$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption21$SpeDayTues[which(total_consumption21$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption21$SpeDayWedn[which(total_consumption21$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption21$SpeDayThur[which(total_consumption21$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption21$SpeDayFrid[which(total_consumption21$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption21$SpeDaySatu[which(total_consumption21$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption21$SpeDaySund[which(total_consumption21$event_date < 
+                                                           (max(total_consumption$event_date) - 2))])
+arima_model21 = auto.arima(total_consumption21$WeeklyDiff[which(total_consumption21$event_date < 
+                                                                  (max(total_consumption$event_date) - 2))],
+                           xreg = regressor21)
+
+regressor22 <- cbind(total_consumption22$RelDayMond[which(total_consumption22$event_date < 
+                                                            (max(total_consumption$event_date) - 2))], 
+                    total_consumption22$RelDayTues[which(total_consumption22$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption22$RelDayWedn[which(total_consumption22$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption22$RelDayThur[which(total_consumption22$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption22$RelDayFrid[which(total_consumption22$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption22$RelDaySatu[which(total_consumption22$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption22$RelDaySund[which(total_consumption22$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption22$SpeDayMond[which(total_consumption22$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption22$SpeDayTues[which(total_consumption22$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption22$SpeDayWedn[which(total_consumption22$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption22$SpeDayThur[which(total_consumption22$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption22$SpeDayFrid[which(total_consumption22$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption22$SpeDaySatu[which(total_consumption22$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption22$SpeDaySund[which(total_consumption22$event_date < 
+                                                           (max(total_consumption$event_date) - 2))])
+arima_model22 = auto.arima(total_consumption22$WeeklyDiff[which(total_consumption22$event_date < 
+                                                                  (max(total_consumption$event_date) - 2))],
+                           xreg = regressor22)
+
+regressor23 <- cbind(total_consumption23$RelDayMond[which(total_consumption23$event_date < 
+                                                            (max(total_consumption$event_date) - 2))], 
+                    total_consumption23$RelDayTues[which(total_consumption23$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption23$RelDayWedn[which(total_consumption23$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption23$RelDayThur[which(total_consumption23$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption23$RelDayFrid[which(total_consumption23$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption23$RelDaySatu[which(total_consumption23$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption23$RelDaySund[which(total_consumption23$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption23$SpeDayMond[which(total_consumption23$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption23$SpeDayTues[which(total_consumption23$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption23$SpeDayWedn[which(total_consumption23$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption23$SpeDayThur[which(total_consumption23$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption23$SpeDayFrid[which(total_consumption23$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption23$SpeDaySatu[which(total_consumption23$event_date < 
+                                                           (max(total_consumption$event_date) - 2))],
+                    total_consumption23$SpeDaySund[which(total_consumption23$event_date < 
+                                                           (max(total_consumption$event_date) - 2))])
+arima_model23 = auto.arima(total_consumption23$WeeklyDiff[which(total_consumption23$event_date < 
+                                                                  (max(total_consumption$event_date) - 2))],
+                           xreg = regressor23)
+
+```
+
+After building arima model for each hour, we can forecast the future period from using until day d-2. Since we only know the complete data for day d-2 and need to forecast the consumption for day d+1,  our forecast() function predicts 3 steps ahead. Furthermore, since there are no special or religious days between the forecasting period, we can assign 0 for these columns.
+
+```{r, include=TRUE, results='hide', warning=FALSE, message=FALSE}
+forecast0 <- forecast(arima_model0, xreg = tail(regressor0, 3), h = 3)
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+forecast1 <- forecast(arima_model1, xreg = tail(regressor1, 3), h = 3)
+forecast2 <- forecast(arima_model2, xreg = tail(regressor2, 3), h = 3)
+forecast3 <- forecast(arima_model3, xreg = tail(regressor3, 3), h = 3)
+forecast4 <- forecast(arima_model4, xreg = tail(regressor4, 3), h = 3)
+forecast5 <- forecast(arima_model5, xreg = tail(regressor5, 3), h = 3)
+forecast6 <- forecast(arima_model6, xreg = tail(regressor6, 3), h = 3)
+forecast7 <- forecast(arima_model7, xreg = tail(regressor7, 3), h = 3)
+forecast8 <- forecast(arima_model8, xreg = tail(regressor8, 3), h = 3)
+forecast9 <- forecast(arima_model9, xreg = tail(regressor9, 3), h = 3)
+forecast10 <- forecast(arima_model10, xreg = tail(regressor10, 3), h = 3)
+forecast11 <- forecast(arima_model11, xreg = tail(regressor11, 3), h = 3)
+forecast12 <- forecast(arima_model12, xreg = tail(regressor12, 3), h = 3)
+forecast13 <- forecast(arima_model13, xreg = tail(regressor13, 3), h = 3)
+forecast14 <- forecast(arima_model14, xreg = tail(regressor14, 3), h = 3)
+forecast15 <- forecast(arima_model15, xreg = tail(regressor15, 3), h = 3)
+forecast16 <- forecast(arima_model16, xreg = tail(regressor16, 3), h = 3)
+forecast17 <- forecast(arima_model17, xreg = tail(regressor17, 3), h = 3)
+forecast18 <- forecast(arima_model18, xreg = tail(regressor18, 3), h = 3)
+forecast19 <- forecast(arima_model19, xreg = tail(regressor19, 3), h = 3)
+forecast20 <- forecast(arima_model20, xreg = tail(regressor20, 3), h = 3)
+forecast21 <- forecast(arima_model21, xreg = tail(regressor21, 3), h = 3)
+forecast22 <- forecast(arima_model22, xreg = tail(regressor22, 3), h = 3)
+forecast23 <- forecast(arima_model23, xreg = tail(regressor23, 3), h = 3)
+
+```
+
+As we used difference data for stationarity, we predicted weekly difference for each day. So after performing predictions with our hourly arima models we added our predictions to past data to get actual forecast results. 
+
+```{r, include=TRUE, results='hide', warning=FALSE, message=FALSE}
+total_consumption0[event_date < (max(total_consumption$event_date) - 2), Pred_Diff := WeeklyDiff]
+total_consumption0[event_date > (max(total_consumption$event_date) - 3), Pred_Diff := forecast0$mean]
+total_consumption0[, Forecast := Pred_Diff + shift(consumption, 7)]
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+total_consumption1[event_date < (max(total_consumption$event_date) - 2), Pred_Diff := WeeklyDiff]
+total_consumption1[event_date > (max(total_consumption$event_date) - 3), Pred_Diff := forecast1$mean]
+total_consumption1[, Forecast := Pred_Diff + shift(consumption, 7)]
+
+total_consumption2[event_date < (max(total_consumption$event_date) - 2), Pred_Diff := WeeklyDiff]
+total_consumption2[event_date > (max(total_consumption$event_date) - 3), Pred_Diff := forecast2$mean]
+total_consumption2[, Forecast := Pred_Diff + shift(consumption, 7)]
+
+total_consumption3[event_date < (max(total_consumption$event_date) - 2), Pred_Diff := WeeklyDiff]
+total_consumption3[event_date > (max(total_consumption$event_date) - 3), Pred_Diff := forecast3$mean]
+total_consumption3[, Forecast := Pred_Diff + shift(consumption, 7)]
+
+total_consumption4[event_date < (max(total_consumption$event_date) - 2), Pred_Diff := WeeklyDiff]
+total_consumption4[event_date > (max(total_consumption$event_date) - 3), Pred_Diff := forecast4$mean]
+total_consumption4[, Forecast := Pred_Diff + shift(consumption, 7)]
+
+total_consumption5[event_date < (max(total_consumption$event_date) - 2), Pred_Diff := WeeklyDiff]
+total_consumption5[event_date > (max(total_consumption$event_date) - 3), Pred_Diff := forecast5$mean]
+total_consumption5[, Forecast := Pred_Diff + shift(consumption, 7)]
+
+total_consumption6[event_date < (max(total_consumption$event_date) - 2), Pred_Diff := WeeklyDiff]
+total_consumption6[event_date > (max(total_consumption$event_date) - 3), Pred_Diff := forecast6$mean]
+total_consumption6[, Forecast := Pred_Diff + shift(consumption, 7)]
+
+total_consumption7[event_date < (max(total_consumption$event_date) - 2), Pred_Diff := WeeklyDiff]
+total_consumption7[event_date > (max(total_consumption$event_date) - 3), Pred_Diff := forecast7$mean]
+total_consumption7[, Forecast := Pred_Diff + shift(consumption, 7)]
+
+total_consumption8[event_date < (max(total_consumption$event_date) - 2), Pred_Diff := WeeklyDiff]
+total_consumption8[event_date > (max(total_consumption$event_date) - 3), Pred_Diff := forecast8$mean]
+total_consumption8[, Forecast := Pred_Diff + shift(consumption, 7)]
+
+total_consumption9[event_date < (max(total_consumption$event_date) - 2), Pred_Diff := WeeklyDiff]
+total_consumption9[event_date > (max(total_consumption$event_date) - 3), Pred_Diff := forecast9$mean]
+total_consumption9[, Forecast := Pred_Diff + shift(consumption, 7)]
+
+total_consumption10[event_date < (max(total_consumption$event_date) - 2), Pred_Diff := WeeklyDiff]
+total_consumption10[event_date > (max(total_consumption$event_date) - 3), Pred_Diff := forecast10$mean]
+total_consumption10[, Forecast := Pred_Diff + shift(consumption, 7)]
+
+total_consumption11[event_date < (max(total_consumption$event_date) - 2), Pred_Diff := WeeklyDiff]
+total_consumption11[event_date > (max(total_consumption$event_date) - 3), Pred_Diff := forecast11$mean]
+total_consumption11[, Forecast := Pred_Diff + shift(consumption, 7)]
+
+total_consumption12[event_date < (max(total_consumption$event_date) - 2), Pred_Diff := WeeklyDiff]
+total_consumption12[event_date > (max(total_consumption$event_date) - 3), Pred_Diff := forecast12$mean]
+total_consumption12[, Forecast := Pred_Diff + shift(consumption, 7)]
+
+total_consumption13[event_date < (max(total_consumption$event_date) - 2), Pred_Diff := WeeklyDiff]
+total_consumption13[event_date > (max(total_consumption$event_date) - 3), Pred_Diff := forecast13$mean]
+total_consumption13[, Forecast := Pred_Diff + shift(consumption, 7)]
+
+total_consumption14[event_date < (max(total_consumption$event_date) - 2), Pred_Diff := WeeklyDiff]
+total_consumption14[event_date > (max(total_consumption$event_date) - 3), Pred_Diff := forecast14$mean]
+total_consumption14[, Forecast := Pred_Diff + shift(consumption, 7)]
+
+total_consumption15[event_date < (max(total_consumption$event_date) - 2), Pred_Diff := WeeklyDiff]
+total_consumption15[event_date > (max(total_consumption$event_date) - 3), Pred_Diff := forecast15$mean]
+total_consumption15[, Forecast := Pred_Diff + shift(consumption, 7)]
+
+total_consumption16[event_date < (max(total_consumption$event_date) - 2), Pred_Diff := WeeklyDiff]
+total_consumption16[event_date > (max(total_consumption$event_date) - 3), Pred_Diff := forecast16$mean]
+total_consumption16[, Forecast := Pred_Diff + shift(consumption, 7)]
+
+total_consumption17[event_date < (max(total_consumption$event_date) - 2), Pred_Diff := WeeklyDiff]
+total_consumption17[event_date > (max(total_consumption$event_date) - 3), Pred_Diff := forecast17$mean]
+total_consumption17[, Forecast := Pred_Diff + shift(consumption, 7)]
+
+total_consumption18[event_date < (max(total_consumption$event_date) - 2), Pred_Diff := WeeklyDiff]
+total_consumption18[event_date > (max(total_consumption$event_date) - 3), Pred_Diff := forecast18$mean]
+total_consumption18[, Forecast := Pred_Diff + shift(consumption, 7)]
+
+total_consumption19[event_date < (max(total_consumption$event_date) - 2), Pred_Diff := WeeklyDiff]
+total_consumption19[event_date > (max(total_consumption$event_date) - 3), Pred_Diff := forecast19$mean]
+total_consumption19[, Forecast := Pred_Diff + shift(consumption, 7)]
+
+total_consumption20[event_date < (max(total_consumption$event_date) - 2), Pred_Diff := WeeklyDiff]
+total_consumption20[event_date > (max(total_consumption$event_date) - 3), Pred_Diff := forecast20$mean]
+total_consumption20[, Forecast := Pred_Diff + shift(consumption, 7)]
+
+total_consumption21[event_date < (max(total_consumption$event_date) - 2), Pred_Diff := WeeklyDiff]
+total_consumption21[event_date > (max(total_consumption$event_date) - 3), Pred_Diff := forecast21$mean]
+total_consumption21[, Forecast := Pred_Diff + shift(consumption, 7)]
+
+total_consumption22[event_date < (max(total_consumption$event_date) - 2), Pred_Diff := WeeklyDiff]
+total_consumption22[event_date > (max(total_consumption$event_date) - 3), Pred_Diff := forecast22$mean]
+total_consumption22[, Forecast := Pred_Diff + shift(consumption, 7)]
+
+total_consumption23[event_date < (max(total_consumption$event_date) - 2), Pred_Diff := WeeklyDiff]
+total_consumption23[event_date > (max(total_consumption$event_date) - 3), Pred_Diff := forecast23$mean]
+total_consumption23[, Forecast := Pred_Diff + shift(consumption, 7)]
+```
+
+At the end of the forecasting process, we should combine the data for the latest day and prepare for submission. 
+
+```{r, include=TRUE, results='hide', warning=FALSE, message=FALSE}
+final_table <- rbind(tail(total_consumption0, 1), tail(total_consumption1, 1),
+                     tail(total_consumption2, 1), tail(total_consumption3, 1),
+                     tail(total_consumption4, 1), tail(total_consumption5, 1),
+                     tail(total_consumption6, 1), tail(total_consumption7, 1),
+                     tail(total_consumption8, 1), tail(total_consumption9, 1),
+                     tail(total_consumption10, 1), tail(total_consumption11, 1),
+                     tail(total_consumption12, 1), tail(total_consumption13, 1),
+                     tail(total_consumption14, 1), tail(total_consumption15, 1),
+                     tail(total_consumption16, 1), tail(total_consumption17, 1),
+                     tail(total_consumption18, 1), tail(total_consumption19, 1),
+                     tail(total_consumption20, 1), tail(total_consumption21, 1),
+                     tail(total_consumption22, 1), tail(total_consumption23, 1))
+
+predictions=data.table(Date=rep(as.Date(Sys.time()) + 2,24),Hour=0:23)
+predictions=predictions[order(Date,Hour)]
+predictions[,forecast:=final_table$Forecast]
+
+send_submission(predictions, token, url=subm_url, submit_now=F)
+```
+
+
+### 4. Forecasting with Simple MA Model
+
+After unsatisfactory results of the arima model, we proceeded with a more naive forecasting method which is called Simple Moving Average. For our case we determine our MA period as 2 weeks. Since there are no religious or special days from the beginning of the 2021, the hourly and weekly consumption amounts will be quiet close. So, our forecasts for the future period should be similar to the consumption of past two weeks. By considering these two facts, applying a Simple MA method with 2-week period would work fine for our limited time period. We can add the average of the consumptions of last 2 weeks as a new column to the hourly data and use them as forecast values.
+
+MA model for example hour0: 
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+total_consumption0[, MA2 := (shift(total_consumption0$consumption, 7) + shift(total_consumption0$consumption, 14)) / 2]
+```
+
+```{r include=FALSE}
+total_consumption1[, MA2 := (shift(total_consumption1$consumption, 7) + shift(total_consumption1$consumption, 14)) / 2]
+total_consumption2[, MA2 := (shift(total_consumption2$consumption, 7) + shift(total_consumption2$consumption, 14)) / 2]
+total_consumption3[, MA2 := (shift(total_consumption3$consumption, 7) + shift(total_consumption3$consumption, 14)) / 2]
+total_consumption4[, MA2 := (shift(total_consumption4$consumption, 7) + shift(total_consumption4$consumption, 14)) / 2]
+total_consumption5[, MA2 := (shift(total_consumption5$consumption, 7) + shift(total_consumption5$consumption, 14)) / 2]
+total_consumption6[, MA2 := (shift(total_consumption6$consumption, 7) + shift(total_consumption6$consumption, 14)) / 2]
+total_consumption7[, MA2 := (shift(total_consumption7$consumption, 7) + shift(total_consumption7$consumption, 14)) / 2]
+total_consumption8[, MA2 := (shift(total_consumption8$consumption, 7) + shift(total_consumption8$consumption, 14)) / 2]
+total_consumption9[, MA2 := (shift(total_consumption9$consumption, 7) + shift(total_consumption9$consumption, 14)) / 2]
+total_consumption10[, MA2 := (shift(total_consumption10$consumption, 7) + shift(total_consumption10$consumption, 14)) / 2]
+total_consumption11[, MA2 := (shift(total_consumption11$consumption, 7) + shift(total_consumption11$consumption, 14)) / 2]
+total_consumption12[, MA2 := (shift(total_consumption12$consumption, 7) + shift(total_consumption12$consumption, 14)) / 2]
+total_consumption13[, MA2 := (shift(total_consumption13$consumption, 7) + shift(total_consumption13$consumption, 14)) / 2]
+total_consumption14[, MA2 := (shift(total_consumption14$consumption, 7) + shift(total_consumption14$consumption, 14)) / 2]
+total_consumption15[, MA2 := (shift(total_consumption15$consumption, 7) + shift(total_consumption15$consumption, 14)) / 2]
+total_consumption16[, MA2 := (shift(total_consumption16$consumption, 7) + shift(total_consumption16$consumption, 14)) / 2]
+total_consumption17[, MA2 := (shift(total_consumption17$consumption, 7) + shift(total_consumption17$consumption, 14)) / 2]
+total_consumption18[, MA2 := (shift(total_consumption18$consumption, 7) + shift(total_consumption18$consumption, 14)) / 2]
+total_consumption19[, MA2 := (shift(total_consumption19$consumption, 7) + shift(total_consumption19$consumption, 14)) / 2]
+total_consumption20[, MA2 := (shift(total_consumption20$consumption, 7) + shift(total_consumption20$consumption, 14)) / 2]
+total_consumption21[, MA2 := (shift(total_consumption21$consumption, 7) + shift(total_consumption21$consumption, 14)) / 2]
+total_consumption22[, MA2 := (shift(total_consumption22$consumption, 7) + shift(total_consumption22$consumption, 14)) / 2]
+total_consumption23[, MA2 := (shift(total_consumption23$consumption, 7) + shift(total_consumption23$consumption, 14)) / 2]
+```
+
+At the end of the forecasting process, we should combine the data for the latest day and prepare for submission.
+
+```{r,include=TRUE, results='hide', warning=FALSE, message=FALSE}
+
+final_table <- rbind(tail(total_consumption0, 1), tail(total_consumption1, 1),
+                     tail(total_consumption2, 1), tail(total_consumption3, 1),
+                     tail(total_consumption4, 1), tail(total_consumption5, 1),
+                     tail(total_consumption6, 1), tail(total_consumption7, 1),
+                     tail(total_consumption8, 1), tail(total_consumption9, 1),
+                     tail(total_consumption10, 1), tail(total_consumption11, 1),
+                     tail(total_consumption12, 1), tail(total_consumption13, 1),
+                     tail(total_consumption14, 1), tail(total_consumption15, 1),
+                     tail(total_consumption16, 1), tail(total_consumption17, 1),
+                     tail(total_consumption18, 1), tail(total_consumption19, 1),
+                     tail(total_consumption20, 1), tail(total_consumption21, 1),
+                     tail(total_consumption22, 1), tail(total_consumption23, 1))
+
+predictions=data.table(Date=rep(as.Date(Sys.time()) + 2,24),Hour=0:23)
+predictions=predictions[order(Date,Hour)]
+predictions[,forecast:=final_table$MA2]
+
+send_submission(predictions, token, url=subm_url, submit_now=F)
+
+```
+
+### 5. Conclusion and Future Works
+
+In this term project, it can be understood that the electricity consumption for Turkey is increasing day by day, the reasons behind the increasing trend didn't scrutinize in the project but it can be related to increased GDP, increased consumption understanding, increased industry index in Turkey etc. Our ARIMA model is founded and worked on the religious and special days outliers effects and MA model is focused on short-term forecasting performance. In the ARIMA case, we divided the total data to 24 different data sets and build auto.arima for each one. Then forecasted the day d+1 for only special and religious day regressors. The WMAPE score it is observed that, the model is not enough for market-usage. After ARIMA model, we change our perspective to different and more simple forecasting methods which is Simple MA. In the Simple MA model, we use only one and two week behind data and forecast the day d+1 days' identified hour. In the short-run period, we can say that, if there is not any important special or religious outlier day, the MA model works well enough. On the other hand, for long-run period the ARIMA model works well with respect to simple MA because the effects of special and religious days on consumption are significant. 
+
+And also, in order to improve for both model we should add extra required regressors for instance industry index, the heatmap and temperature values with weigthed average for different regions, the effects of covid term, etc. In a working environment that provides directly access to these data, both models can perform much better than the present case.
+
+Please, check the [RMD file](https://bu-ie-360.github.io/fall20-livadogann/files/project-rep.Rmd) to reach full-document of the both models. 
+
+
+
+
+
+
+
+
+
+
+
+
+
